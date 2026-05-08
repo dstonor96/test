@@ -1,375 +1,548 @@
-# ASN (Advanced Shipping Notice) Processing — End-to-End Flow
-
-## 1. Overview
-
-The ASN processing pipeline notifies customers (primarily internet/PartStore ordering customers) that their parts are being shipped or backordered. It is triggered as part of the **document acknowledgment** process and spans six COBOL programs:
-
-| Program | Role |
-|---------|------|
-| **PCC0055** | Interactive Document Acknowledgment UI (ACKPCDOC) |
-| **PCC0056** | Batch/Auto Document Acknowledgment Engine (PCJN0056A NEPS job) |
-| **PCC0191** | ASN Notification Dispatcher — sends data queue or web-service message |
-| **FDC0191** | FDC (Field Dealer Customization) hook — populates custom header/ship/backorder fields |
-| **PCC8014** | I-O service program for the Customer Order database (PCLCODB0) |
-| **PCC8039** | I-O service program for the Acknowledgment Request file (PCLCOAR0) |
+# Jira Change Request — BSO-742
 
 ---
 
-## 2. Process Trigger — How Acknowledgment Starts
+## Summary
 
-### 2a. Interactive Path — PCC0055
+**Bulk Discount Code Import Automation (UII0020)**
 
-1. A user launches the **ACKPCDOC** function from a menu.
-2. PCC0055 displays screen **PCS0055** (format PC300551), where up to **15 document numbers** can be entered with an action code (`*` = acknowledge, `R` = review, `C` = change auto-ack date/time, `B` = pre-bin).
-3. Documents are validated:
-   - Must exist in PCLCODB0 (customer order header, format PC1COHD0).
-   - Doc status must be `D` (shipped), `T` (transferred), or `E` (eligible).
-   - Not already in process (`A`), cancelled (`C`), invoiced (`F`), held (`B`), repricing (`G`/`R`), or deleted (`X`).
-   - B2C orders (myParts.cat.com) go through additional OMS transmit and tracking-info checks.
-   - DPIS Country-of-Origin documents require completed country-code maintenance.
-   - Work order segments are checked for record locks.
-4. Valid documents are submitted to PCC0056 for processing via the call `CALL "PCC0056"`.
-
-### 2b. Batch / Auto-Acknowledgment Path — PCC0056 (Entry Point)
-
-1. The NEPS job **PCJN0056A** calls PCC0056 directly.
-2. PCC0056 reads the **Acknowledgment Request file** (`PCLCOAR0`, format PC1COAK0) sequentially.
-3. Each trigger record contains a `REF-DOCUMENT-NO-PC1COAK0` identifying the document to acknowledge.
-4. Optionally, a preprocess program **PCC0056A** inspects trigger records for data integrity before processing. If errors are found, the trigger is deleted and the NEPS job moves to the next record.
-5. The program reads the corresponding **Customer Order Header** (`PCLCODB0`, format PC1COHD0) and performs the same eligibility checks as the interactive path (doc status, B2C tracking, DPIS, work-order locks, etc.).
+New ILE program suite to automate the bulk upload of SPAR pricing records from a CSV file on the IFS into production file `UIPPREB0`, replacing the existing manual macro process via MNTSPPRC that operates on ~30,000 lines and historically requires multiple days to complete.
 
 ---
 
-## 3. Core Acknowledgment Processing — PCC0056
+## Change Request Details
 
-After validation, PCC0056 routes processing based on **transaction code** and **sales type**:
-
-| Tran Code | Sales Type | Route | Description |
-|-----------|------------|-------|-------------|
-| CS, CT | T | `D100-TRANSFER` | Store-to-store transfer |
-| CS, CT | B | `E100-BACKORDER-TRANSFER` | Backorder fill from stock |
-| CR, CU, SR, SU | — | `C100-RETURNS` | Return / credit documents |
-| CS, CT, SS, ST, CQ, SQ | — | `B100-SALES` | Standard counter/shop sales |
-| CD, SD | — | `F100-WORN-CORES` | Worn core distribution |
-
-### Key Processing Steps (B100-SALES path as representative example)
-
-1. **Read parts detail** — iterates through `PCLCODB0` (PC1COPD0) records for the document.
-2. **Inventory updates** — updates `PCPPIPT0` (parts master) and `PCPPIST0` (store record) for on-hand quantities, call & demand, last receipt date.
-3. **Stock replenishment** — reads/creates `PCLSRDB0` records (PCPSRON0, PCPSRCN0, PCPSRPD0).
-4. **Suffix document creation** (`B200-CREATE-NEW-DOCUMENT`) — when backorders exist, creates a new suffix document (A→B→C…→Z) with the backordered parts. Copies header, detail, notes, ship-to, and language records.
-5. **Invoice trigger** — determines whether to create an invoice trigger record:
-   - Immediate invoice (`W-INVIMD = "Y"`) creates a `WOLINVS0` record or, with Multiple Consolidated Invoicing enabled, a `PCTINVG0` record via `ACPCR0056A`.
-   - Consolidated billing (`BIL-IND = "D"`) waits until all related documents are acknowledged.
-6. **Consolidated billing check** (`B130`) — for bill indicator `D`, scans all related documents to confirm they are all acknowledged before releasing the batch to invoicing.
-7. **EDI processing** (`B150-DETERMINE-IF-EDI`) — checks `CSLEDII0` to determine if the customer receives EDI acknowledgments; if so, calls **PCC0140**.
-8. **Core distribution** — if applicable, calls **PCC0257** / **PCC0285** for core cross-reference processing.
-9. **Audit trail** — calls **PCC2201** / **PCC2203** to write parts accounting and audit trail records.
-10. **Direct Ship** — for direct-ship documents (Direct Ship Indicator = `A`), creates confirmation copies via `PCLCOPR0` and handles DST backorder transfer/fill pairing.
-11. **Header update** — rewrites the PC1COHD0 with updated doc status (`E` or `F`), acknowledgment date/time, and clears the reprice indicator.
-12. **Acknowledgment message** — writes a result record to `PCLCOAM0` with success (`Y`) or warning (`W`) status.
+| Field | Value |
+|---|---|
+| **Jira Ticket** | BSO-742 |
+| **Type** | New Development |
+| **Priority** | High |
+| **Assignee** | Daniel Stonor |
+| **BRD Reference** | BSO-742 — Business Requirements Document |
+| **Date Raised** | 16 April 2026 |
+| **Target Completion** | 08 May 2026 |
+| **Environment** | IBM i (AS/400) — Library derived from `SMDADTAE` data area (e.g. `LIBU08`) |
+| **Application Area** | User Interface / Inventory / SPAR Pricing |
+| **Menu Path** | `UPMENU -> MNTSPPRC -> LODSPPRC` |
 
 ---
 
-## 4. ASN Email / Notification — The Internet Order Path
+## Business Justification
 
-This is the core ASN flow and is triggered **only for internet orders**.
+The current process for loading approved discount codes into `UIPPREB0` is performed manually through the MNTSPPRC (Maintain SPAR Prices) screen — one record at a time. With approximately **30,000 records** per upload cycle, this process takes **multiple days** of operator effort and is prone to data entry errors.
 
-### 4.1 Trigger Condition (PCC0056, section A100-2)
-
-```
-IF DOC-STATUS-PC1COHD0 = "D" AND
-   TERMINAL-NAME-PC1COHD0 = "INTERNET"
-   → Check data queue PSARCHEQ exists
-   → If line item count ≤ 250 (ship + backorder)
-   → PERFORM 6000-SEND-EMAIL
-```
-
-This check occurs **before** the main acknowledgment processing begins, ensuring the ASN notification captures the document's parts before any suffix document creation modifies the data.
-
-### 4.2 Section 6000-SEND-EMAIL (PCC0056)
-
-This section populates the **PC50191** copybook (the ASN data structure) and calls PCC0191:
-
-1. **Initialize** `SHIP-BO-EMAIL-PC50191`
-2. **Populate header fields:**
-   - `CUST-NO-PC50191` ← Customer number from order header
-   - `REF-DOCUMENT-NO-PC50191` ← Document number
-   - `STORE-NO-PC50191` ← Store number
-   - `DATE-PC50191` ← Current system date (YYYYMMDD)
-   - `TIME-PC50191` ← Current system time (HHMMSS)
-   - `SHIP-VIA-CODE-PC50191` ← Ship-via code from order header
-   - `SHIP-VIA-DESC-PC50191` ← Ship-via description
-   - `MSG-TYPE-PC50191` ← `"S"` (shipment) if no suffix, `"B"` (backorder) if suffix exists
-3. **Populate dealer code** — reads `PCLSRPA0` (stock replenishment parameters, format PC1SRST0) to get the 4-character dealer code.
-4. **Call FDC0191** with detail type `"H"` (header) — allows dealer-custom header fields to be populated.
-5. **Read customer email** — reads `PCLCODB0` (format PC1CONT0, note line 50) to retrieve the customer's email address from the order notes.
-6. **Load parts arrays** — starts reading PC1COPD0 records for the document:
-
-#### 6400-LOAD-PARTS-ARRAY
-
-For each parts detail record:
-
-| Condition | Action |
-|-----------|--------|
-| Has backorder qty AND ship qty > 0 | Add to **both** ship array AND backorder array |
-| Has backorder qty, no ship qty | Add to **backorder array only** |
-| No backorder qty, ship qty > 0 | Add to **ship array only** |
-
-For each entry:
-- **Ship array:** `SHIP-QTY-PC50191`, `SHIP-PART-NO-PC50191`, `SHIP-DESC-PC50191`
-- **Backorder array:** `BO-QTY-PC50191`, `BO-PART-NO-PC50191`, `BO-DESC-PC50191`
-- Calls **FDC0191** with detail type `"S"` (ship) or `"B"` (backorder) after each line item to allow custom fields per line.
-
-7. **Call PCC0191** — `CALL "PCC0191" USING SHIP-BO-EMAIL-PC50191`
+This change introduces an automated bulk import that:
+- Reduces processing time from **days** to **minutes**
+- Eliminates manual data entry errors
+- Provides full validation against reference files before insert
+- Automatically archives production data before each import
+- Logs all failed records with detailed error reasons to a CSV
+- Sends styled HTML email notifications with results
+- Supports both ad-hoc (interactive) and scheduled execution
 
 ---
 
-## 5. PCC0191 — ASN Notification Dispatcher
+## Scope of Change
 
-PCC0191 receives the populated PC50191 copybook and determines the delivery method:
+### New Objects Created
 
-### 5.1 Customer Internet Parameters Check
+| Object | Type | Library | Source Lib/File | Description |
+|---|---|---|---|---|
+| `UIS0020` | DSPF (Display File) | `UPLNG500` | `UPSRC500/QDDSSRC` | 5-format interactive display file |
+| `UIR0020` | *MODULE (SQLRPGLE) | `UPPGM500` | `UPSRC500/QRPGLESRC` | Bulk record validator/processor |
+| `UIM0020` | *MODULE (CLLE) | `UPPGM500` | `UPSRC500/QCLLESRC` | CL orchestration module |
+| `UII0020` | *PGM (ILE Bound) | `UPPGM500` | — (bound from modules) | Main ILE program (entry: `UIM0020`) |
+| `UIC0020` | *PGM (COBOL) | `UPPGM500` | `UPSRC500/QLBLSRC` | Thin COBOL wrapper for DBS menu integration |
+| `UIM0020C` | *PGM (CLP) | — | — | Compilation driver (build automation) |
 
-```
-READ PCLINCU0 (Customer Internet Profile) for CUST-NO
-IF ASN-TYPE-PC1INCU0 ≠ "D" → EXIT (no ASN for this customer)
-```
+### Existing Objects Modified
 
-Only customers with ASN type = `"D"` (DBS ASN) are eligible.
+| Object | Type | Nature of Change |
+|---|---|---|
+| `UIPPREB0` | *FILE (Physical) | **No structural change** — records inserted/deleted during processing |
+| `UIPPREH0` | *FILE (Physical) | **No structural change** — receives history copies of replaced records |
+| `LODSPPRC` | Menu program | Must be updated to call `UIC0020` (COBOL wrapper) |
 
-### 5.2 Data Preparation
+### No Database Schema Changes
 
-**Section 1004-MOVE-TO-DATAQ:** Copies the extended data record (with custom fields) into the standard data queue format:
-- Header fields (dealer code, customer, document, store, date, time, ship-via, email)
-- Ship parts array (up to 250 entries: qty, part number, description)
-- Backorder parts array (up to 250 entries: qty, part number, description)
-- **XML special character encoding** — email ID, part descriptions, and custom values are scanned for `&`, `<`, `>`, `"`, `'` and replaced with XML entity references (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`).
-
-### 5.3 Delivery Method Decision
-
-```
-READ CSPWEBF0 (Web Service Parameters) for key "ACPCR00006"
-IF SWITCH-CS1WEBF0 = "Y" → Web Service path
-ELSE → EXIT (no ASN delivery if web service is off and not DTAQ)
-```
-
-### 5.4 Path A — Data Queue (DTAQ) Delivery
-
-If `ASN-TYPE = "D"` and web service is not enabled:
-```
-CALL "QSNDDTAQ" USING DATA-QUEUE-NAME ("PSARCHEQ")
-                       DATA-QUEUE-LIB ("*LIBL")
-                       DATA-QUEUE-LENGTH (21700)
-                       DATA-QUEUE-RECORD
-```
-
-The data queue record (up to 21,700 bytes) is placed on `PSARCHEQ` for consumption by a downstream email-sending process.
-
-### 5.5 Path B — Web Service Delivery
-
-If web service switch = `"Y"`:
-
-1. **Section 1001-MOVE-TO-ASN-VARIABLE:** Copies data into `ASN-DATA-ACPC1ASND0` structure:
-   - Header: valid key (`PSF21`), dealer code, customer, document, store, date, time, ship-via, email, message type
-   - Ship parts array (up to 250): qty, part, description + custom fields per line (up to 20 custom fields per line item)
-   - Backorder parts array (up to 250): qty, part, description + custom fields per line
-   - Header custom fields (up to 20)
-   - All descriptions are XML-entity-encoded
-
-2. **Add CITI libraries:** `CALL "ACPCM00002" USING ADD-LIBL`
-
-3. **Send via web service:** `CALL "ACPCR00003" USING ASN-DATA-ACPC1ASND0`
-   - `ACPCR00003` is the web service client program that transmits the ASN XML to the configured endpoint.
-
-4. **Remove CITI libraries:** `CALL "ACPCM00002" USING REMOVE-LIBL`
+This solution inserts into the existing `UIPPREB0` layout. No DDL changes, no new physical files created in production. Staging and validation work files are created in `QTEMP` (job-scoped, automatically cleaned up).
 
 ---
 
-## 6. FDC0191 — Dealer Custom Fields Hook
+## Technical Design
 
-FDC0191 is a **dealer-customizable exit point** called by PCC0056 during ASN data population. It is called up to **three times per document**:
-
-| Call | Detail Type | Purpose |
-|------|-------------|---------|
-| 1 | `"H"` (Header) | Populate header-level custom fields |
-| 2 | `"S"` (Ship) | Populate per-ship-line custom fields |
-| 3 | `"B"` (Backorder) | Populate per-backorder-line custom fields |
-
-### Parameters Received
-
-| Parameter | Copybook | Description |
-|-----------|----------|-------------|
-| `SHIP-BO-EMAIL-PC50191` | PC50191 | The ASN data structure being built |
-| `CUST-ORDR-HEADER-PC1COHD0` | PC1COHD0 | Current document header |
-| `CUST-ORDR-PARTS-DTL-PC1COPD0` | PC1COPD0 | Current parts detail line |
-| `FDC-ERRMSG` | — | Error message (output) |
-| `FDC-DTL-TYP` | — | `"H"`, `"S"`, or `"B"` |
-
-### Default Implementation (WesTrac)
-
-The current FDC0191 implementation populates:
-
-| Type | Custom Field | Value |
-|------|-------------|-------|
-| Header | `CUST-NAME-PC50191(1)` = "Customer PO No" | `CUST-PO-NO-PC1COHD0` |
-| Ship | `SHIP-CUST-NAME(n,1)` = "Ship Line No" | `CUST-ITEM-NUMBER-PC1COPD0` |
-| Ship | `SHIP-CUST-NAME(n,2)` = "Customer Part No" | `CUST-PART-NUMBER-PC1COPD0` |
-| Backorder | `BO-CUST-NAME(n,1)` = "BO Line No" | `CUST-ITEM-NUMBER-PC1COPD0` |
-| Backorder | `BO-CUST-NAME(n,2)` = "Customer Part No" | `CUST-PART-NUMBER-PC1COPD0` |
-
-This allows the ASN email/XML to include the customer's own PO number, item numbers, and part numbers alongside the DBS part information.
-
----
-
-## 7. I-O Service Programs
-
-### PCC8014 — Customer Order File I-O
-
-- Provides standardized CRUD operations on `PCLCODB0` (multi-format logical file).
-- Supports formats: PC1COHD0 (header), PC1COPD0 (parts detail), PC1COBO0 (backorder), PC1COMD0 (misc detail), PC1CONT0 (notes), PC1COCN0 (case number).
-- Called by PCC0055 to read document data during interactive acknowledgment.
-- Uses linkage section parameters: FUNCTION, FORMAT-NAME, FILE-STATUS, KEY-AREA, RECORD-AREA.
-
-### PCC8039 — Acknowledgment Request File I-O
-
-- Provides standardized CRUD operations on `PCLCOAR0` (format PC1COAK0).
-- Supports: read, read-next, read-prior, write, rewrite, delete, start operations.
-- Opened I-O (read-write) to allow both reading trigger records and writing/updating result records.
-- Handles record lock detection and returns lock messages via MESSAGE-AREA parameter.
-
----
-
-## 8. Data Flow Diagram
+### Architecture Overview
 
 ```
-┌─────────────┐     ┌─────────────┐
-│   PCC0055   │     │  PCJN0056A  │
-│ Interactive │     │  NEPS Job   │
-│   (User)    │     │  (Batch)    │
-└──────┬──────┘     └──────┬──────┘
-       │                   │
-       │  CALL PCC0056     │  Direct Entry
-       ▼                   ▼
-┌──────────────────────────────────┐
-│           PCC0056                │
-│   Document Acknowledgment       │
-│                                  │
-│  ┌─ PCC8014 ─► PCLCODB0        │ Read order header/detail
-│  │                               │
-│  ├─ PCC8039 ─► PCLCOAR0        │ Read/write ack requests
-│  │                               │
-│  ├─ B100/C100/D100/E100/F100    │ Sales/Returns/Transfers/BO/Cores
-│  │                               │
-│  ├─ 6000-SEND-EMAIL ───────┐    │ (Internet orders only)
-│  │                          │    │
-│  │  ┌───────────────────┐   │    │
-│  │  │ 6400-LOAD-PARTS   │   │    │
-│  │  │   ┌───────────┐   │   │    │
-│  │  │   │ FDC0191   │   │   │    │ Custom fields per line
-│  │  │   └───────────┘   │   │    │
-│  │  └───────────────────┘   │    │
-│  │                          │    │
-│  │  CALL PCC0191 ◄──────────┘    │
-│  │                               │
-│  └─ A200-WRITE-MESSAGE ─► PCLCOAM0  │ Result/status
-└──────────────────────────────────┘
-                │
-                ▼
-┌──────────────────────────────────┐
-│           PCC0191                │
-│   ASN Notification Dispatcher    │
-│                                  │
-│  Read PCLINCU0 (Customer IP)     │
-│  Check ASN-TYPE = "D"            │
-│                                  │
-│  XML encode special characters   │
-│                                  │
-│  ┌────────────┬─────────────┐    │
-│  │ Path A     │ Path B      │    │
-│  │ QSNDDTAQ  │ ACPCR00003  │    │
-│  │ PSARCHEQ  │ Web Service  │    │
-│  └────────────┴─────────────┘    │
-└──────────────────────────────────┘
-                │
-                ▼
-     ┌─────────────────────┐
-     │ Downstream Consumer │
-     │ (Email / XML ASN)   │
-     └─────────────────────┘
+LODSPPRC (DBS Menu)
+  └── UIC0020 (COBOL wrapper — receives DS5LINK, calls UII0020)
+        └── UII0020 (Bound ILE Program)
+              ├── UIM0020 (CLLE — orchestration, screens, email)
+              │     ├── UIS0020 (DSPF — 5 record formats)
+              │     └── UIR0020 (SQLRPGLE — validation & bulk SQL)
+              └── (ACTGRP *CALLER)
+```
+
+### Program Flow
+
+#### Interactive Mode (MODE = 'I')
+
+1. **UIS0020M** — Selection screen: Option 1 (Ad-hoc) or Option 2 (Schedule)
+2. **UIS0020A** — Ad-hoc confirmation (F6 required to proceed; Enter does NOT confirm)
+3. **UIS0020S** — Schedule entry (job name, date DD/MM/YY, time HH:MM:SS with full validation)
+4. **UIS0020F** — CSV format reference screen (accessible via F8)
+5. **Processing** — Steps 1–6 below
+6. **UIS0020C** — Results screen (counts, elapsed time, status badge)
+
+#### Batch Mode (MODE = 'B')
+
+- Skips all interactive screens
+- Executes Steps 1–6 directly
+- Sends completion/escape messages to job log
+- Sends HTML email notification
+
+#### Processing Steps
+
+| Step | Description | Key Commands/Calls |
+|---|---|---|
+| **1** | Verify IFS source CSV exists | `CHKOBJLNK` |
+| **2** | Archive `UIPPREB0` before import (1 month retention) | `CRTARCF` to `ARCDBF/SPRC` |
+| **3a** | Create staging file `QTEMP/UISTG020` from production layout | `CRTDUPOBJ`, `RNMM` |
+| **3b** | Count total CSV data rows (header excluded) | `CPYFRMSTMF` + `RTVMBRD` |
+| **3c** | Import CSV into staging file | `CPYFRMIMPF` (CCSID 1208→37, comma-delimited, skip header) |
+| **4** | Validate, deduplicate, and insert via `UIR0020` | `CALLPRC UIR0020` |
+| **5** | Calculate elapsed time, determine status (S/P/F) | Internal calculation |
+| **6** | Archive processed CSV to `/Inventory/Archive/` with timestamp | `CPY` via `QCMDEXC` |
+| **7** | Display results (interactive) or send job log message (batch) | `SNDRCVF` / `SNDPGMMSG` |
+| **8** | Send HTML email notification (with error CSV attachment if applicable) | `SNDSMTPEMM` via `SBMJOB` |
+| **9** | Clean up error CSV asynchronously | `QSH CMD('sleep 5 && rm -f ...')` via `SBMJOB` |
+
+### UIR0020 — Validation & Bulk Processing (SQLRPGLE)
+
+#### Phase 1: Set-Based Validation
+- Bulk inserts all staging records into `QTEMP/UIVAL020`
+- Flags blank mandatory fields (CUNO, SOS1, etc.)
+- Flags invalid AGRI indicator (must be S/P/R/M)
+- Validates date format and range (DDMMYYYY packed 8,0)
+- Validates Finish Date > Start Date (compared as YYYYMMDD)
+- Validates against reference files via bulk JOINs:
+  - **Customer** → `CILNAME0`
+  - **SOS** → `PCPSRSS0`
+  - **BECTYC** → `PCPPIPT0`
+  - **CMCD** → `PCPPIPT0`
+  - **Part Number** → `PCPPIPT0`
+- Determines record type for valid records
+- Writes failed records with reason to IFS error CSV via C-runtime `open()`/`write()`/`close()`
+
+#### Phase 2: Set-Based Bulk Operations
+- Bulk copy matching duplicates to history (`UIPPREH0`)
+- Bulk delete matched duplicates from `UIPPREB0`
+- Bulk insert all validated records into `UIPPREB0`
+
+> **Performance Note:** Phase 1+2 replaced a row-by-row approach (5 SELECT lookups × ~82K rows = ~410K individual I/O cycles) with set-based SQL, reducing to 3 bulk statements plus per-reference-file UPDATE statements.
+
+### CSV Format
+
+| Col | Field | Type | Len | Description |
+|---|---|---|---|---|
+| 1 | CUNO | Text | 7 | Customer Number |
+| 2 | SOS1 | Text | 3 | Source of Supply |
+| 3 | PANO20 | Text | 20 | Part Number |
+| 4 | CATPANO16 | Text | 20 | C of A Part Number |
+| 5 | CMCD | Text | 2 | Commodity Code |
+| 6 | BECTYC | Text | 3 | Bus Econ Comm Code |
+| 7 | CUSTDISC | Numeric | 5,2 | Cust Discount (0–100) |
+| 8 | WESTDISC | Numeric | 5,2 | WesTrac Discount (0–100) |
+| 9 | SPSELL | Numeric | 15,2 | Special Sell Price (≥0) |
+| 10 | SPCOST | Numeric | 15,2 | Special Cost Price (≥0) |
+| 11 | SDATE | Numeric | 8,0 | Start Date (DDMMYYYY) |
+| 12 | FDATE | Numeric | 8,0 | Finish Date (DDMMYYYY) |
+| 13 | AGRI | Text | 1 | Agreement Indicator (S/P/R/M) |
+| 14 | CUSTYP | Text | 1 | Customer Type Indicator |
+| 15 | AGRNO | Text | 15 | Agreement Number |
+| 16 | REMARK | Text | 50 | Remarks (optional) |
+
+**CSV Requirements:** Comma-delimited, header row present, CRLF line endings, UTF-8 encoding (CCSID 1208).
+
+### IFS Paths
+
+| Path | Purpose |
+|---|---|
+| `/Inventory/UIPPREB0.csv` | Source CSV (uploaded by Inventory team) |
+| `/Inventory/UIPPREB0_Import_Errors.csv` | Error output (per-record failure reasons) |
+| `/Inventory/Archive/UIPPREB0_DDMMYY_HHMMSS.csv` | Archived source CSV (timestamped) |
+
+### Email Notification
+
+- Sent via `SNDSMTPEMM` under system user profile (e.g. `XUPT08CDIS`)
+- Styled HTML email with WesTrac branding (black/gold header, logo)
+- Includes stats table: Job ID, Date/Time, Records Read/Loaded/Failed, Elapsed Time
+- Colour-coded status badge: Green (Success), Amber (Partial), Red (Failed)
+- Error CSV attached as `.txt` when failures exist
+
+---
+
+## IFS & File Dependencies
+
+### Reference Files Accessed (Read-Only Validation)
+
+| File | Purpose |
+|---|---|
+| `CILNAME0` | Customer master — validate CUNO exists |
+| `PCPSRSS0` | SOS reference — validate SOS1 exists |
+| `UCLPIPT0` | Part number master — validate PANO20 exists |
+| `UCLPIPT1` | Part number alternate — secondary lookup |
+| `PCLPICM0` | Commodity code reference — validate CMCD exists |
+| `PCPPIPT0` | BECTYC / CMCD / Part reference |
+
+### Production Files (Read/Write)
+
+| File | Operations |
+|---|---|
+| `UIPPREB0` | DELETE (matched duplicates), INSERT (validated records) |
+| `UIPPREH0` | INSERT (history/audit copy of replaced records) |
+
+### System Objects
+
+| Object | Purpose |
+|---|---|
+| `SMDADTAE` | Data area — production library name |
+| `ARCDBF/SPRC` | Archive library/file for `CRTARCF` backups |
+
+---
+
+## Compilation & Deployment
+
+### Build Procedure
+
+Run `CALL UIM0020C` — the automated compilation driver. Sequence:
+
+1. `CRTDSPF` — Display file `UIS0020` into `UPLNG500`
+2. `CRTSQLRPGI` — SQLRPGLE module `UIR0020` into `UPPGM500`
+3. `CRTCLMOD` — CLLE module `UIM0020` into `UPPGM500`
+4. `CRTPGM` — Bind `UIM0020` + `UIR0020` into `UII0020` (`ACTGRP(*CALLER)`)
+5. `DLTMOD` — Clean up intermediate modules
+6. `CRTCBLPGM` — COBOL wrapper `UIC0020` into `UPPGM500`
+
+### Source Libraries
+
+| Library | Source File | Members |
+|---|---|---|
+| `UPSRC500` | `QDDSSRC` | `UIS0020` |
+| `UPSRC500` | `QRPGLESRC` | `UIR0020` |
+| `UPSRC500` | `QCLLESRC` | `UIM0020` |
+| `UPSRC500` | `QLBLSRC` | `UIC0020` |
+
+---
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Production data corruption in `UIPPREB0` | Low | High | Automatic `CRTARCF` archive taken before every import (Step 2). 1-month retention in `ARCDBF/SPRC`. |
+| CSV format mismatch / bad data | Medium | Medium | Multi-layer validation: `CPYFRMIMPF` parse errors caught, UIR0020 validates every field against reference files. Failed records logged with reason. |
+| Duplicate records overwriting valid data | Low | Medium | Duplicate detection with history copy to `UIPPREH0` before delete+re-add. Full audit trail preserved. |
+| Email notification failure | Low | Low | `MONMSG` on `SNDSMTPEMM`. Processing results still shown on screen (interactive) or job log (batch). |
+| IFS file not present at runtime | Medium | Low | `CHKOBJLNK` check at Step 1 with clear error message before any processing begins. |
+| Scheduled job runs with stale CSV | Low | Medium | CSV is archived after processing; next run will fail at Step 1 if no new CSV uploaded. |
+
+---
+
+## Rollback Plan
+
+1. **Restore `UIPPREB0`** from the automatic archive in `ARCDBF/SPRC` (created at Step 2 of every run)
+2. **Remove new objects:** `DLTPGM UII0020`, `DLTPGM UIC0020`, `DLTF UIS0020`
+3. **Revert menu entry** in `LODSPPRC` to remove the `UIC0020` call
+4. **No database schema changes** to revert — `UIPPREB0` and `UIPPREH0` structures are unchanged
+
+---
+
+## Testing Evidence
+
+### Test Scenarios
+
+| # | Scenario | Expected Result | Status |
+|---|---|---|---|
+| 1 | Ad-hoc load with valid CSV (~30K rows) | All records loaded, status = SUCCESS, email sent | |
+| 2 | Ad-hoc load with mixed valid/invalid rows | Valid loaded, invalid logged to error CSV, status = PARTIAL | |
+| 3 | Ad-hoc load with all invalid rows | Zero loaded, all logged, status = FAILED | |
+| 4 | CSV file missing from IFS | Fails at Step 1 with clear message, no data touched | |
+| 5 | Duplicate records in CSV (same CUNO/SOS1/PANO20) | Existing deleted, history written to `UIPPREH0`, new inserted | |
+| 6 | Schedule for future date/time | `ADDJOBSCDE` created successfully, confirmation message displayed | |
+| 7 | Schedule with past date | Rejected with "Date cannot be in the past" | |
+| 8 | Schedule with past time (today) | Rejected with "Time cannot be in the past for today" | |
+| 9 | Batch mode execution (MODE='B') | No screens displayed, processes directly, sends email | |
+| 10 | F6 confirmation required on ad-hoc screen | Enter key redisplays with reminder; only F6 proceeds | |
+| 11 | F8 CSV format reference screen | Displays column layout; F12 returns to main | |
+| 12 | Email with error attachment | HTML email received with error CSV attached | |
+| 13 | Email without errors | HTML email received, no attachment | |
+| 14 | Archive created before import | `ARCDBF/SPRC` contains timestamped backup | |
+
+---
+
+## Screenshots
+
+> **Instructions:** Replace each placeholder below with the relevant screenshot. Capture the green-screen or browser output as appropriate.
+
+---
+
+### Screenshot 1: Selection Screen (UIS0020M)
+> Shows the initial selection screen with Option 1 (Ad-hoc) and Option 2 (Schedule), IFS source/target paths, and import rules.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020M HERE <<<             ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## 9. Key Database Files
+### Screenshot 2: Ad-hoc Confirmation Screen (UIS0020A)
+> Shows the F6 confirmation prompt before starting immediate processing.
 
-| Physical File | Logical File | Format | Description |
-|---------------|-------------|--------|-------------|
-| PCPCOHD0 | PCLCODB0 | PC1COHD0 | Customer order header |
-| PCPCOPD0 | PCLCODB0 | PC1COPD0 | Customer order parts detail |
-| PCPCOBO0 | PCLCODB0 | PC1COBO0 | Customer order backorder detail |
-| PCPCONT0 | PCLCODB0 | PC1CONT0 | Customer order notes (email at line 50) |
-| PCPCOMD0 | PCLCODB0 | PC1COMD0 | Customer order misc detail |
-| PCPCOAK0 | PCLCOAR0 | PC1COAK0 | Acknowledgment request/trigger records |
-| PCPCOAK0 | PCLCOAM0 | — | Acknowledgment message/result records |
-| PCPCOPA0 | PCLCOPA0 | PC1COPA0 | Customer order parameters |
-| PCPCOSP0 | PCLCOSP0 | PC1COSP0 | Customer order ship-to |
-| PCPPIPT0 | PCLPICM0 | PC1PIPT0 | Parts inventory part master |
-| PCPPIST0 | PCLPICM0 | PC1PIST0 | Parts inventory store record |
-| PCPSRON0 | PCLSRDB0 | PC1SRON0 | Stock replenishment order |
-| PCPSRCN0 | PCLSRDB0 | PC1SRCN0 | Stock replenishment case |
-| PCPSRPD0 | PCLSRDB0/PCLSRPD0 | PC1SRPD0 | Stock replenishment parts detail |
-| PCLINCU0 | — | PC1INCU0 | Customer internet profile (ASN type) |
-| CSPWEBF0 | — | CS1WEBF0 | Web service parameters |
-| WOPINVS0 | WOLINVS0 | WO1INVS0 | Invoice trigger file |
-| PCTINVG0 | — | — | Multiple consolidated invoicing trigger |
-| PSARCHEQ | — | — | Data queue for ASN email messages |
-| CSPEDIC0 | CSLEDII0 | CS1EDIC0 | EDI customer profile |
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020A HERE <<<             ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
 
 ---
 
-## 10. Key Copybooks
+### Screenshot 3: Schedule Entry Screen (UIS0020S)
+> Shows the job scheduling fields (job name, date, time, description) with validation example.
 
-| Copybook | Purpose |
-|----------|---------|
-| **PC50191** | ASN email/notification data structure — header + ship array (250) + backorder array (250) + custom fields |
-| **ACPC1ASND0** | ASN web service data structure (extended, with custom fields per line) |
-| **PC1COHD0** | Customer order header layout |
-| **PC1COPD0** | Customer order parts detail layout |
-| **PC1COAK0** | Acknowledgment request record layout |
-| **PC1INCU0** | Customer internet parameters layout |
-| **CS1WEBF0** | Web service switch record layout |
-| **DS5FUNC** | Standard I-O function codes (read, write, rewrite, delete, start, etc.) |
-| **DS5STAT** | Standard file status codes |
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020S HERE <<<             ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
 
 ---
 
-## 11. Processing Constraints & Limits
+### Screenshot 4: CSV Format Reference Screen (UIS0020F)
+> Shows the expected CSV column layout reference accessible via F8.
 
-| Constraint | Limit | Behaviour |
-|------------|-------|-----------|
-| Parts per ASN | 250 ship + 250 backorder | If either count > 250, email is **skipped** |
-| Custom fields per line | 20 | Array dimension in PC50191 |
-| Custom header fields | 20 | Array dimension in PC50191 |
-| Data queue record size | 21,700 bytes | PSARCHEQ record length |
-| Suffix documents | A through Z (26 max) | Error written to PCPCOAK0 if exceeded |
-| Record lock retries | 5 attempts | Then rollback + skip to next trigger |
-
----
-
-## 12. Error Handling
-
-- **Record locks:** Up to 5 retry attempts. On the 5th failure, a ROLLBACK is issued and the program moves to the next trigger record. Lock info is journaled with type `PC`.
-- **Missing records:** "Document not found" or "not eligible" messages written to PCPCOAK0 with indicator `W` (warning).
-- **Preprocess errors (PCC0056A):** If the preprocess program detects data integrity issues, it sets `DELETE-TRIGGER-SW = "Y"`, the trigger is cleaned up, and processing continues with the next record.
-- **Disaster routine (Z999):** Fatal errors (permanent I-O errors, undefined functions) are routed to the disaster routine which logs the error context (file, format, paragraph, key, status) and terminates the job.
-- **System shutdown:** PCC0056 checks the SYSTEM-SHUTDOWN special name and exits gracefully if a shutdown is pending.
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020F HERE <<<             ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
 
 ---
 
-## 13. Commitment Control
+### Screenshot 5: Results Screen — Successful Load (UIS0020C)
+> Shows the results screen after a fully successful import (all records loaded, status = SUCCESS).
 
-PCC0056 operates under **commitment control** for the following files:
-- PCLCOAR0, PCLCOAM0, PCLCODB0 (multiple opens), PCLCOPA0, PCLCOSP0, PCLSRDB0, PCLPICM0, WOLINVS0, PCLCCPR0, PCLLDOC0, PCLCOBO0, PCLPOTF0, WOLHDRS0, PCLSRPD0/PCLSRPD2, PCLCOPR0, PCLDPME0
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020C (SUCCESS) HERE <<<   ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
 
-A COMMIT is issued after successfully processing each acknowledgment request. A ROLLBACK is issued on record lock timeout or processing errors to ensure data consistency.
+---
+
+### Screenshot 6: Results Screen — Partial Success (UIS0020C)
+> Shows the results screen after import with some failed records (status = PARTIAL).
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020C (PARTIAL) HERE <<<   ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 7: Results Screen — Failed Load (UIS0020C)
+> Shows the results screen after a completely failed import (status = FAILED).
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIS0020C (FAILED) HERE <<<    ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 8: Email Notification — Success
+> Shows the HTML email received after a successful import (WesTrac branded, green status badge).
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF SUCCESS EMAIL HERE <<<        ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 9: Email Notification — Partial (with Error Attachment)
+> Shows the HTML email received after a partial import (amber status badge, error CSV attached).
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF PARTIAL EMAIL HERE <<<        ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 10: Email Notification — Failed
+> Shows the HTML email received after a failed import (red status badge).
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF FAILED EMAIL HERE <<<         ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 11: Error CSV Sample
+> Shows a sample of the `UIPPREB0_Import_Errors.csv` output with ERROR_REASON column populated.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF ERROR CSV HERE <<<            ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 12: Archive File in ARCDBF
+> Shows the archive entry created in `ARCDBF/SPRC` before import.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF ARCDBF ARCHIVE HERE <<<       ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 13: IFS Archive Directory
+> Shows the `/Inventory/Archive/` directory with timestamped CSV backups.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF IFS ARCHIVE DIR HERE <<<      ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 14: Scheduled Job Entry (WRKJOBSCDE)
+> Shows the scheduled job entry created via Option 2.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF WRKJOBSCDE HERE <<<           ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 15: Compilation — UIM0020C Success Messages
+> Shows the completion messages from running `CALL UIM0020C` (all components compiled successfully).
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF COMPILE MESSAGES HERE <<<     ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 16: Validation Error — Invalid Option
+> Shows UIS0020M with the "INVALID OPTION - ENTER 1/2" error message highlighted.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF INVALID OPTION HERE <<<       ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 17: Schedule Validation — Past Date/Time
+> Shows UIS0020S with date or time past-check error highlighted.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF PAST DATE ERROR HERE <<<      ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 18: UIPPREB0 Record Verification (Optional)
+> Shows a DSPPFM or SQL query of `UIPPREB0` confirming records were loaded correctly.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIPPREB0 DATA HERE <<<        ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Screenshot 19: UIPPREH0 History Records (Optional)
+> Shows history records written to `UIPPREH0` for duplicate replacements.
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                                                          ║
+║   >>> INSERT SCREENSHOT OF UIPPREH0 HISTORY HERE <<<     ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+## Approvals
+
+| Role | Name | Date | Signature |
+|---|---|---|---|
+| Developer | Daniel Stonor | | |
+| Reviewer | | | |
+| Business Owner | | | |
+| Change Manager | | | |
+
+---
+
+*Document generated: 08 May 2026*
+*BRD Reference: BSO-742 — Business Requirements Document*
